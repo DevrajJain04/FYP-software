@@ -33,8 +33,8 @@ class VehicleSimulator:
         self,
         ingestion_url: str = "http://localhost:8080",
         num_vehicles: int = 100,
-        center_lat: float = 1.3521,  # Singapore
-        center_lng: float = 103.8198,
+        center_lat: float = 19.0760,  # Mumbai
+        center_lng: float = 72.8777,
         area_radius_km: float = 5.0,
         update_interval: float = 5.0,  # seconds
     ):
@@ -225,8 +225,8 @@ async def main():
     parser = argparse.ArgumentParser(description="Vehicle Telemetry Simulator")
     parser.add_argument("--url", default="http://localhost:8080", help="Ingestion service URL")
     parser.add_argument("--vehicles", type=int, default=100, help="Number of vehicles")
-    parser.add_argument("--lat", type=float, default=1.3521, help="Center latitude")
-    parser.add_argument("--lng", type=float, default=103.8198, help="Center longitude")
+    parser.add_argument("--lat", type=float, default=19.0760, help="Center latitude")
+    parser.add_argument("--lng", type=float, default=72.8777, help="Center longitude")
     parser.add_argument("--radius", type=float, default=5.0, help="Area radius in km")
     parser.add_argument("--interval", type=float, default=5.0, help="Update interval in seconds")
     parser.add_argument("--individual", action="store_true", help="Send individual requests instead of batch")

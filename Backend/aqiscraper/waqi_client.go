@@ -38,10 +38,8 @@ func (s *ScraperService) fetchWAQIStationsInBounds(latMin, lngMin, latMax, lngMa
 
 	var stations []*StationAQIData
 	for _, st := range mapResp.Data {
-		// Skip stations in India (we get those from aqi.in)
-		if isInIndia(st.Lat, st.Lon) {
-			continue
-		}
+		// Note: Previously skipped India (expecting aqi.in data), but aqi.in scraper
+		// is unreliable, so we now include all WAQI stations globally.
 
 		aqi, err := strconv.ParseFloat(st.AQI, 64)
 		if err != nil || aqi <= 0 {
@@ -52,11 +50,12 @@ func (s *ScraperService) fetchWAQIStationsInBounds(latMin, lngMin, latMax, lngMa
 		latLng := h3.NewLatLng(st.Lat, st.Lon)
 		h3Index := h3.LatLngToCell(latLng, s.h3Resolution)
 
-		// Parse city and country from station name
-		city, country := parseStationName(st.Name)
+		// Parse city and country from station name (now in st.Station.Name)
+		stationName := st.Station.Name
+		city, country := parseStationName(stationName)
 
 		station := &StationAQIData{
-			Location:    st.Name,
+			Location:    stationName,
 			City:        city,
 			Country:     country,
 			Latitude:    st.Lat,

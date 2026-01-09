@@ -1,3 +1,9 @@
+//go:build ignore
+// +build ignore
+
+// This file is deprecated. Use entrypoint.go instead.
+// Kept for reference but excluded from build.
+
 package main
 
 import (

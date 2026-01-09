@@ -1,4 +1,5 @@
-version: '3.8'
+# Green Corridor Backend Services
+# Note: 'version' attribute removed (obsolete in modern Docker Compose)
 
 services:
   # Redis - Shared State Store

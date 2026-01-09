@@ -23,6 +23,8 @@ type TelemetryService struct {
 
 // NewTelemetryService creates a new telemetry service
 func NewTelemetryService(redisRepo *repository.RedisRepository, postgresRepo *repository.PostgresRepository, h3Resolution, aqiTTLSeconds int) *TelemetryService {
+	log.Printf("📊 TelemetryService initialized: h3_resolution=%d aqi_ttl=%ds postgres_enabled=%v",
+		h3Resolution, aqiTTLSeconds, postgresRepo != nil)
 	return &TelemetryService{
 		redisRepo:     redisRepo,
 		postgresRepo:  postgresRepo,

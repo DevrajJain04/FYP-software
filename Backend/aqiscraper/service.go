@@ -72,6 +72,8 @@ func (s *ScraperService) FetchAllStations() error {
 		name                           string
 		latMin, lngMin, latMax, lngMax float64
 	}{
+		// India (South Asia) - added since aqi.in scraper is unreliable
+		{"India", 6.0, 68.0, 37.0, 98.0},
 		// Southeast Asia (includes Singapore)
 		{"Southeast Asia", -11.0, 95.0, 24.0, 142.0},
 		// East Asia

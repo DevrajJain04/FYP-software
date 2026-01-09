@@ -195,3 +195,91 @@ func fetchHandler(w http.ResponseWriter, r *http.Request) {
 		"message": "Check /health for progress",
 	})
 }
+
+// BatchH3Request represents a request for multiple H3 lookups
+type BatchH3Request struct {
+	H3Indexes []string `json:"h3_indexes"`
+}
+
+// BatchH3Response represents batch lookup results
+type BatchH3Response struct {
+	Results map[string]*BatchH3Result `json:"results"`
+	Found   int                       `json:"found"`
+	Total   int                       `json:"total"`
+}
+
+// BatchH3Result represents a single H3 lookup result
+type BatchH3Result struct {
+	Found      bool            `json:"found"`
+	ExactMatch bool            `json:"exact_match,omitempty"`
+	DistanceKm float64         `json:"distance_km,omitempty"`
+	Station    *StationAQIData `json:"station,omitempty"`
+}
+
+// batchH3Handler handles batch H3 lookups for efficient AQI fetching
+// This reduces the number of HTTP round-trips from routing-service
+func batchH3Handler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error": "POST method required"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req BatchH3Request
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error": "invalid JSON body"}`, http.StatusBadRequest)
+		return
+	}
+
+	if len(req.H3Indexes) == 0 {
+		http.Error(w, `{"error": "h3_indexes array required"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Limit batch size to prevent abuse
+	maxBatch := 2000
+	if len(req.H3Indexes) > maxBatch {
+		req.H3Indexes = req.H3Indexes[:maxBatch]
+	}
+
+	results := make(map[string]*BatchH3Result)
+	found := 0
+
+	for _, h3Index := range req.H3Indexes {
+		result := &BatchH3Result{Found: false}
+
+		// Try exact match first
+		station := service.GetStationByH3(h3Index)
+		if station != nil {
+			result.Found = true
+			result.ExactMatch = true
+			result.Station = station
+			found++
+		} else {
+			// Fallback to nearest station
+			cell := h3.Cell(h3.IndexFromString(h3Index))
+			if cell.IsValid() {
+				latLng := cell.LatLng()
+				nearestStation, dist := service.GetNearestStationWithDistance(latLng.Lat, latLng.Lng)
+				if nearestStation != nil {
+					result.Found = true
+					result.ExactMatch = false
+					result.DistanceKm = dist
+					result.Station = nearestStation
+					found++
+				}
+			}
+		}
+
+		results[h3Index] = result
+	}
+
+	response := BatchH3Response{
+		Results: results,
+		Found:   found,
+		Total:   len(req.H3Indexes),
+	}
+
+	_ = json.NewEncoder(w).Encode(response)
+}

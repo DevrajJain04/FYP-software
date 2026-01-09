@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"log"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -16,6 +17,7 @@ type TelemetryHandler struct {
 
 // NewTelemetryHandler creates a new telemetry handler
 func NewTelemetryHandler(svc *service.TelemetryService) *TelemetryHandler {
+	log.Println("📡 TelemetryHandler initialized")
 	return &TelemetryHandler{
 		service: svc,
 	}
@@ -64,11 +66,15 @@ func (h *TelemetryHandler) IngestTelemetry(c *fiber.Ctx) error {
 
 	hexagonID, err := h.service.IngestTelemetry(&data)
 	if err != nil {
+		log.Printf("❌ Telemetry ingestion failed for vehicle %s: %v", data.VehicleID, err)
 		return c.Status(fiber.StatusInternalServerError).JSON(models.TelemetryResponse{
 			Success: false,
 			Message: "Failed to ingest telemetry: " + err.Error(),
 		})
 	}
+
+	log.Printf("✅ Telemetry ingested: vehicle=%s hex=%s aqi=%.1f lat=%.4f lng=%.4f",
+		data.VehicleID, hexagonID, data.AQI, data.Latitude, data.Longitude)
 
 	return c.Status(fiber.StatusOK).JSON(models.TelemetryResponse{
 		Success:   true,
@@ -100,6 +106,7 @@ func (h *TelemetryHandler) IngestBatchTelemetry(c *fiber.Ctx) error {
 
 	processed, failed, err := h.service.IngestBatchTelemetry(&batch)
 	if err != nil {
+		log.Printf("❌ Batch ingestion failed: %v (attempted %d records)", err, len(batch.Data))
 		return c.Status(fiber.StatusInternalServerError).JSON(models.BatchTelemetryResponse{
 			Success: false,
 			Message: "Failed to process batch: " + err.Error(),
@@ -107,6 +114,9 @@ func (h *TelemetryHandler) IngestBatchTelemetry(c *fiber.Ctx) error {
 	}
 
 	elapsed := time.Since(startTime)
+
+	log.Printf("📦 Batch ingestion complete: processed=%d failed=%d total=%d duration=%v",
+		processed, failed, len(batch.Data), elapsed)
 
 	return c.Status(fiber.StatusOK).JSON(models.BatchTelemetryResponse{
 		Success:   true,

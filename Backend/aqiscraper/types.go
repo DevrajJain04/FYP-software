@@ -27,11 +27,14 @@ type StationAQIData struct {
 type WAQIMapBoundsResponse struct {
 	Status string `json:"status"`
 	Data   []struct {
-		Lat  float64 `json:"lat"`
-		Lon  float64 `json:"lon"`
-		UID  int     `json:"uid"`
-		AQI  string  `json:"aqi"`
-		Name string  `json:"name"`
+		Lat     float64 `json:"lat"`
+		Lon     float64 `json:"lon"`
+		UID     int     `json:"uid"`
+		AQI     string  `json:"aqi"`
+		Station struct {
+			Name string `json:"name"`
+			Time string `json:"time"`
+		} `json:"station"`
 	} `json:"data"`
 }
 

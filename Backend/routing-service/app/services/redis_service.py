@@ -7,6 +7,7 @@ import logging
 import json
 import httpx
 import h3
+import asyncio
 
 from app.core.config import settings
 
@@ -186,6 +187,7 @@ class RedisService:
         """
         Get AQI for multiple hexagons efficiently using pipeline.
         Falls back to scraped station data for hexagons without vehicle readings.
+        Uses batch API call to scraper service for better performance.
         
         Returns:
             Dict mapping hexagon_id to median AQI
@@ -212,18 +214,92 @@ class RedisService:
                 else:
                     missing_hexagons.append(hex_id)
             
-            # Fallback for missing hexagons using station data
+            # Fallback for missing hexagons using station data (batch API)
             if settings.USE_STATION_FALLBACK and missing_hexagons:
-                for hex_id in missing_hexagons:
-                    fallback_aqi = await self._get_station_aqi_fallback(hex_id)
-                    if fallback_aqi is not None:
-                        result[hex_id] = fallback_aqi
+                batch_results = await self._get_batch_station_aqi_fallback(missing_hexagons)
+                result.update(batch_results)
             
             return result
             
         except Exception as e:
             logger.error(f"Error getting AQI for multiple hexagons: {e}")
             return {}
+    
+    async def _get_batch_station_aqi_fallback(self, hexagon_ids: List[str]) -> Dict[str, float]:
+        """
+        Batch fallback to scraped station AQI data using the /h3/batch endpoint.
+        Much more efficient than individual requests for hundreds of hexagons.
+        
+        Args:
+            hexagon_ids: List of H3 hexagon IDs to look up
+            
+        Returns:
+            Dict mapping hexagon_id to AQI value
+        """
+        if not settings.SCRAPER_SERVICE_URL or not self._http_client:
+            return {}
+        
+        result = {}
+        
+        try:
+            # Use batch endpoint for efficiency (single HTTP call vs hundreds)
+            response = await self._http_client.post(
+                f"{settings.SCRAPER_SERVICE_URL}/h3/batch",
+                json={"h3_indexes": hexagon_ids},
+                timeout=30.0  # Longer timeout for batch requests
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                batch_results = data.get('results', {})
+                
+                for hex_id, res in batch_results.items():
+                    if res.get('found') and res.get('station'):
+                        aqi = res['station'].get('aqi', settings.DEFAULT_AQI)
+                        result[hex_id] = float(aqi)
+                
+                logger.debug(f"Batch AQI fallback: {data.get('found', 0)}/{data.get('total', 0)} hexagons resolved")
+            else:
+                # Fallback to individual requests if batch endpoint unavailable
+                logger.warning(f"Batch endpoint returned {response.status_code}, falling back to individual requests")
+                result = await self._get_individual_station_aqi_fallback(hexagon_ids)
+                
+        except httpx.TimeoutException:
+            logger.warning("Batch AQI request timed out, falling back to individual requests")
+            result = await self._get_individual_station_aqi_fallback(hexagon_ids)
+        except Exception as e:
+            logger.warning(f"Batch AQI fallback failed: {e}, falling back to individual requests")
+            result = await self._get_individual_station_aqi_fallback(hexagon_ids)
+        
+        return result
+    
+    async def _get_individual_station_aqi_fallback(self, hexagon_ids: List[str]) -> Dict[str, float]:
+        """
+        Fallback to individual station AQI lookups (used when batch endpoint unavailable).
+        Uses semaphore to limit concurrent requests.
+        """
+        result = {}
+        
+        # Limit concurrency to avoid overwhelming the scraper service
+        semaphore = asyncio.Semaphore(50)
+        
+        async def fetch_single(hex_id: str) -> Tuple[str, Optional[float]]:
+            async with semaphore:
+                aqi = await self._get_station_aqi_fallback(hex_id)
+                return hex_id, aqi
+        
+        # Gather all requests concurrently (with limited parallelism)
+        tasks = [fetch_single(hex_id) for hex_id in hexagon_ids]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        for item in results:
+            if isinstance(item, Exception):
+                continue
+            hex_id, aqi = item
+            if aqi is not None:
+                result[hex_id] = aqi
+        
+        return result
     
     async def get_all_hexagon_keys(self) -> List[str]:
         """Get all hexagon keys from Redis."""

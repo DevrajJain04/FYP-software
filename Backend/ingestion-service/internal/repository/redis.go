@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"fmt"
+	"log"
 	"strconv"
 	"time"
 
@@ -24,6 +25,8 @@ type RedisRepository struct {
 
 // NewRedisRepository creates a new Redis repository
 func NewRedisRepository(redisURL string) (*RedisRepository, error) {
+	log.Printf("🔗 Connecting to Redis at %s...", redisURL)
+
 	client := redis.NewClient(&redis.Options{
 		Addr:         redisURL,
 		Password:     "", // No password by default
@@ -40,6 +43,8 @@ func NewRedisRepository(redisURL string) (*RedisRepository, error) {
 	if err := client.Ping(ctx).Err(); err != nil {
 		return nil, fmt.Errorf("failed to connect to Redis: %w", err)
 	}
+
+	log.Printf("✅ Redis connected successfully (pool_size=100)")
 
 	return &RedisRepository{
 		client: client,

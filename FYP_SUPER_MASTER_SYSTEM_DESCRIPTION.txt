@@ -1,0 +1,620 @@
+GREEN CORRIDOR (FYP) — SUPER MASTER LOW-LEVEL SYSTEM DESCRIPTION
+=========================================================
+Generated from the current workspace source tree.
+
+This document is intentionally “low level”: it describes what runs, what calls what, what data structures look like, and the key implementation modules (entrypoints, handlers, services, repositories, and client code).
+
+
+0) Workspace Topology (what exists)
+----------------------------------
+Workspace root: FYP/
+
+A) Backend/  (Docker-compose orchestrated microservices)
+- docker-compose.yml
+- README.md
+- BACKEND_MASTER_DOCUMENTATION.md
+- BACKEND_SCHEMA_DETAILS.txt
+- CODEMAP.md
+- aqiscraper/             (Go service; scrapes station AQI; exposes HTTP API; writes to Redis)
+- ingestion-service/      (Go service; ingests vehicle telemetry; writes to Redis and optionally Timescale/Postgres)
+- routing-service/        (Python FastAPI service; AQI-aware routing over OSMnx graph; reads Redis; optionally calls ORS)
+- scripts/                (Python tooling: end-to-end tests and telemetry simulator)
+
+B) weighted-routing-app/  (React SPA frontend)
+- package.json, README.md
+- FRONTEND_MASTER_DOCUMENTATION.md
+- docs/*                  (integration guide + long implementation report)
+- src/*                   (pages, components, services, utilities)
+- analysis/aqi_ml_analysis.ipynb (not part of runtime; analysis notebook)
+
+
+1) System Goal and High-Level Behavior
+--------------------------------------
+Goal:
+- Compute routes that trade off travel time vs air quality exposure.
+- Visualize AQI as a heatmap and provide route alternatives.
+- Ingest live vehicle sensor telemetry (AQI + GPS) and use it as a real-time AQI signal.
+- Supplement telemetry with monitoring-station AQI from scraped sources.
+
+Key architectural decisions:
+- Use Uber H3 (hexagonal indexing) at a fixed resolution as the canonical spatial bucket.
+- Redis is the “hot” store for near-real-time AQI per H3 cell and per vehicle.
+- TimescaleDB/Postgres is the “cold” store for historical telemetry (optional; can be disabled).
+- Routing service constructs a road graph (OSMnx) and enriches edges with AQI derived from H3 coverage.
+
+
+2) Runtime Topology (Docker Compose)
+-----------------------------------
+Primary orchestrator: Backend/docker-compose.yml
+
+All services share a Docker network (bridge): green-corridor-network
+
+2.1) Containers and default ports
+- redis (Redis 7)
+  - Host: localhost:6379
+  - Role: hot key/value store for telemetry-derived AQI and station data
+
+- timescaledb (Postgres 15 + Timescale extension)
+  - Host: localhost:5432
+  - Role: historical telemetry persistence; hypertables + indexes (best-effort)
+
+- ingestion-service (Go, Fiber)
+  - Host: localhost:8080
+  - Role: accepts telemetry; H3 indexing; writes to Redis; optionally persists to Timescale
+
+- routing-service (Python, FastAPI)
+  - Host: localhost:8000
+  - Role: constructs/caches OSM graph; fetches AQI from Redis; performs AQI-aware routing; can optionally call ORS for turn-by-turn navigation
+
+- aqiscraper (Go)
+  - Host: localhost:8082
+  - Role: scrapes AQI monitoring stations (aqi.in + WAQI regions); maps to H3; stores in Redis; provides batch AQI lookup endpoints for the routing service
+
+
+3) Canonical Data Model and Spatial Indexing
+--------------------------------------------
+3.1) Coordinate conventions
+- Backend routing API returns route geometry as [lng, lat] coordinate pairs (GeoJSON-style ordering).
+- Frontend Leaflet expects [lat, lng]. The frontend converts accordingly.
+
+3.2) H3 resolution
+- Services coordinate on H3_RESOLUTION (commonly 9).
+- Resolution 9 corresponds to ~170m hex edges (ballpark), used as the atomic AQI aggregation region.
+
+3.3) AQI representation
+- AQI values are handled as numeric scalars (0–500 typical US AQI range).
+- Redis aggregation uses median/mean strategies depending on endpoint; routing often uses median per hex as a robust measure.
+
+
+4) Backend Services — Deep Breakdown
+-----------------------------------
+
+4.1) Ingestion Service (Go) — telemetry ingestion
+Folder: Backend/ingestion-service/
+Entrypoint: Backend/ingestion-service/cmd/server/main.go
+
+Core responsibilities:
+- Validate incoming telemetry payloads.
+- Compute H3 hexagon id for GPS point.
+- Persist “hot” telemetry-derived AQI into Redis with TTL.
+- Optionally persist telemetry to Postgres/Timescale.
+- Provide health + stats endpoints.
+
+Key modules:
+- internal/config/config.go
+  - Reads env vars such as PORT, REDIS_URL, POSTGRES_URL, H3_RESOLUTION, AQI_TTL_SECONDS, ENABLE_PERSIST.
+
+- internal/handler/telemetry.go
+  - HTTP handlers for:
+    - POST /api/v1/telemetry
+    - POST /api/v1/telemetry/batch
+    - GET  /api/v1/stats
+  - Performs request parsing/validation and delegates to service layer.
+
+- internal/handler/health.go
+  - GET /api/v1/health
+  - Reports service health and dependency status (Redis connectivity etc.).
+
+- internal/service/telemetry.go
+  - Business logic: H3 conversion, Redis writes, optional Postgres writes.
+
+- internal/repository/redis.go
+  - Implements the Redis schema & operations for hot telemetry.
+  - Uses Redis pipelines for efficiency.
+
+- internal/repository/postgres.go
+  - Schema init + inserts.
+  - Attempts to create hypertable (Timescale) and indexes.
+
+Redis write path (conceptual):
+1) Client POST /api/v1/telemetry {vehicle_id, latitude, longitude, aqi, timestamp}
+2) Service computes hex_id = h3(lat, lng, res)
+3) Redis pipeline updates:
+   - per-hex aggregation structure(s)
+   - per-vehicle latest location/value key(s)
+   - TTL refresh for “hot” keys (AQI_TTL_SECONDS)
+4) Optional: async persist to Postgres/Timescale
+
+Design intent:
+- Redis has short-lived “current AQI” derived from moving vehicles.
+- Postgres holds long-lived historical telemetry for analytics.
+
+
+4.2) AQI Scraper Service (Go) — station ingestion & lookup
+Folder: Backend/aqiscraper/
+Entrypoint: Backend/aqiscraper/entrypoint.go
+
+Core responsibilities:
+- Scrape and collect AQI monitoring stations.
+- Provide an HTTP API for the frontend and for routing-service fallback.
+- Map station coordinates to H3 and cache to Redis.
+- Offer a batch H3 lookup endpoint to minimize per-hex network overhead.
+
+Key modules:
+- entrypoint.go
+  - HTTP server setup + CORS.
+  - Routes include:
+    - GET  /health
+    - GET  /stations
+    - GET  /stats
+    - GET  /h3?hex=...                 (single H3)
+    - POST /h3/batch                   (batch H3)
+    - GET  /nearest?lat=...&lng=...
+    - GET  /radius?lat=...&lng=...&km=...
+    - POST /fetch                       (manual fetch trigger)
+  - Periodic scheduler to refresh station data.
+
+- config.go
+  - Config includes:
+    - FETCH_INTERVAL_MINUTES (alias SCRAPE_INTERVAL_MINUTES)
+    - TTL settings
+    - WAQI_API_KEY
+
+- service.go
+  - FetchAllStations: runs scraping + WAQI region fetch concurrently.
+  - Stores results in Redis and in an in-memory cache for quick API responses.
+
+- aqiin_scraper.go
+  - Uses Colly to scrape aqi.in.
+  - Extracts station lat/lng/AQI from site responses (Next.js payload parsing).
+
+- waqi_client.go
+  - WAQI bounds fetch to supplement station set.
+  - Applies filtering/region skips.
+
+Batch lookup contract (why it exists):
+- routing-service often needs AQI for many H3 cells.
+- doing one HTTP call per hex is too slow.
+- /h3/batch provides up to a large fixed maximum (e.g., 2000) per call.
+
+
+4.3) Routing Service (Python) — AQI-aware routing
+Folder: Backend/routing-service/
+Entrypoint: Backend/routing-service/app/main.py
+
+Runtime stack:
+- FastAPI + Uvicorn
+- Redis client for async reads
+- OSMnx for graph acquisition
+- NetworkX for graph representation
+- Shapely/geopandas/numpy/scipy where needed
+
+Key endpoints (Backend/routing-service/app/api/routes.py):
+- GET  /health
+  - Basic service+dependency health report.
+
+- POST /api/v1/route
+  - Input: origin {lat,lng}, destination {lat,lng}, balance, alternatives
+  - Output: list of routes with geometry [lng,lat], metrics, and weighted_cost
+  - Intended for: “multiple alternatives” UI.
+
+- POST /api/v1/route/detailed
+  - Input: origin, destination, balance, alternatives (usually 1)
+  - Output: one “best” route plus optional navigation object
+  - Intended for: “turn-by-turn directions” UI.
+
+- POST /api/v1/navigation
+  - Input: route_coordinates + origin/destination + profile
+  - Output: navigation steps (when ORS is configured)
+
+- GET  /api/v1/aqi/hexagon/{hex_id}
+  - Output: AQI info for a single hex.
+
+- POST /api/v1/aqi/area
+  - Input: bounding box (north,south,east,west)
+  - Output: hexagons with AQI for heatmap visualizations.
+
+- GET  /api/v1/stats
+  - System stats: hexagons with data, resolution, etc.
+
+Routing pipeline (conceptual):
+1) Build or load OSM graph for the requested area
+   - graph_service caches graphs in memory (TTL cache).
+2) Convert the origin/destination to nearest graph nodes.
+3) For each edge considered:
+   - compute which H3 cells the edge intersects
+     - uses edge geometry where available, else interpolates points.
+   - fetch AQI for those H3 cells from Redis
+     - primary source: telemetry-derived hex medians in Redis
+     - fallback: station-derived hex info in Redis
+     - fallback-of-fallback: call aqiscraper /h3/batch
+4) Apply cost function:
+   - balance parameter controls tradeoff between time and AQI.
+   - cost per edge is a weighted combination (implementation details in routing_service.py).
+5) Run A* search to find least-cost path.
+6) Generate additional alternatives by penalizing previously used edges and re-running A* (k-alternatives approximation).
+7) Return metrics:
+   - distance (m)
+   - duration (s)
+   - average_aqi
+   - max_aqi
+   - weighted_cost
+   - route coordinates (polyline)
+
+Key internal modules:
+- app/services/graph_service.py
+  - Graph acquisition via OSMnx.
+  - TTLCache for graphs.
+  - Edge geometry extraction and conversion to H3 coverage.
+  - Edge enrichment with AQI values.
+
+- app/services/routing_service.py
+  - Cost function factory.
+  - Custom A* implementation.
+  - Alternative route generation via penalties.
+  - Route metrics aggregation.
+
+- app/services/redis_service.py
+  - Async Redis operations.
+  - Per-hex aggregation reads (median AQI, vehicle counts).
+  - Station fallback logic.
+  - Batch fallback to aqiscraper for missing hexes.
+
+- app/services/ors_service.py
+  - ORS client integration.
+  - Produces actionable navigation steps.
+
+- app/models/schemas.py
+  - Pydantic request/response models for route requests and navigation.
+
+
+4.4) TimescaleDB/Postgres — historical persistence
+Folder: Backend/ (compose + ingestion repository)
+
+Role:
+- Store telemetry history for analytics and replay.
+- Not required for routing in the “hot” path.
+
+Behavior:
+- ingestion-service can be configured to ENABLE_PERSIST=true/false.
+- On startup, repository/postgres.go attempts:
+  - schema creation
+  - hypertable conversion (if Timescale extension available)
+  - indexes for query performance
+
+
+5) Frontend (React SPA) — Deep Breakdown
+----------------------------------------
+Folder: weighted-routing-app/
+Entrypoint: weighted-routing-app/src/index.js
+Routing: weighted-routing-app/src/App.js (react-router-dom)
+
+Pages (weighted-routing-app/src/pages):
+- HomePage.js       (Dashboard)
+- RoutePlanner.js   (Main route planning UI)
+- AQIMap.js         (Heatmap visualization)
+- StationsPage.js   (Station list + filters)
+- SimulatorPage.js  (Hidden dev tool: telemetry injection)
+
+Navbar:
+- weighted-routing-app/src/components/Navbar.js
+  - Links to Dashboard, Route Planner, AQI Map, Stations
+  - Simulator route exists but is intentionally hidden from navbar
+
+
+5.1) Frontend ↔ Backend API client
+Primary API client: weighted-routing-app/src/services/backendService.js
+
+It unifies calls to:
+- Routing Service:  REACT_APP_ROUTING_API_URL  (default http://localhost:8000)
+- Ingestion Service: REACT_APP_INGESTION_API_URL (default http://localhost:8080)
+- Scraper Service:  REACT_APP_AQI_SCRAPER_URL (default http://localhost:8082)
+
+Key behaviors:
+- fetchWithTimeout wrapper (AbortController-based).
+- NO frontend ORS fallback: ORS is considered a backend concern.
+
+Implemented API methods (representative):
+- calculateRoute(origin, destination, balance, alternatives) → POST /api/v1/route
+- getDetailedRoute(origin, destination, balance) → POST /api/v1/route/detailed
+- getNavigation(route_coordinates, origin, destination, profile) → POST /api/v1/navigation
+- getAreaAQI(bounds) → POST /api/v1/aqi/area
+- getServiceStats() → GET /api/v1/stats
+- submitTelemetry(vehicleId, lat, lng, aqi) → POST ingestion /api/v1/telemetry
+- submitBatchTelemetry(dataArray) → POST ingestion /api/v1/telemetry/batch
+- getIngestionStats() → GET ingestion /api/v1/stats
+- getScrapedStations() → GET scraper /stations
+- getNearestStation(lat,lng) → GET scraper /nearest
+- triggerAQIFetch() → POST scraper /fetch
+- checkBackendHealth() → health checks across services
+- isBackendAvailable() → routing /health probe
+
+
+5.2) RoutePlanner page (primary user flow)
+File: weighted-routing-app/src/pages/RoutePlanner.js
+
+Core UI state:
+- Start & End coordinates and human-readable names
+- balance (0..1): 0 = fastest, 1 = cleanest
+- numAlternatives (1..5) (used when not requesting navigation)
+- wantNavigation (boolean)
+- routes[] + selectedRouteIndex
+- clickMode for selecting start/end via map click
+- dirty state (recalc only on button click)
+
+Key behavior:
+- On mount: checks backend availability (routing /health).
+- On parameter change: marks state as “dirty”, but does not auto-recompute.
+- On “Calculate Route” button:
+  - Validates start/end not identical.
+  - If wantNavigation:
+    - Calls backendService.getDetailedRoute() → expects a single best route with navigation steps.
+  - Else:
+    - Calls backendService.calculateRoute() → expects multiple alternatives.
+  - Converts coordinates [lng,lat] → [lat,lng] for Leaflet.
+  - Assigns labels/colors, selects best route.
+
+Map visualization:
+- Uses MapComponent with draggable start/end pins and clickable alternatives.
+
+Directions:
+- If selected route has steps, shows floating DirectionsPanel.
+
+
+5.3) MapComponent (Leaflet rendering)
+File: weighted-routing-app/src/components/MapComponent.js
+
+Responsibilities:
+- Render base tile map.
+- Render optional AQI “zone” circles (simulated overlay) from src/data/aqiData.
+- Render routes as polylines; selected route drawn on top; alternatives behind.
+- Render draggable markers for start (A) and end (B), custom SVG pins.
+- Fit bounds to show route + endpoints.
+- Map click handler: if clickMode is active, forwards click lat/lng to parent.
+
+
+5.4) DirectionsPanel (turn-by-turn)
+File: weighted-routing-app/src/components/DirectionsPanel.js
+
+Responsibilities:
+- Render summary (distance, duration, average AQI).
+- Render step list.
+- Filters out intermediate “arrive at destination” steps:
+  - because backend can stitch multiple ORS segment requests producing multiple “arrive” steps.
+
+
+5.5) AQIMap page (heatmap visualization)
+File: weighted-routing-app/src/pages/AQIMap.js
+
+Responsibilities:
+- Track map bounds (moveend/zoomend).
+- On fetch button (or auto-refresh):
+  - Calls backendService.getAreaAQI(bounds) to get telemetry-derived hex data.
+  - Optionally calls backendService.getScrapedStations() and filters to current bounds.
+- Renders:
+  - Hexagons as Circle overlays (radius ~150m) colored by median_aqi.
+  - Stations as Circle overlays (radius ~300m) colored by station AQI.
+
+
+5.6) StationsPage (station list)
+File: weighted-routing-app/src/pages/StationsPage.js
+
+Responsibilities:
+- Fetch stations from aqiscraper via backendService.getScrapedStations().
+- Provide client-side filters: search, city, AQI category.
+- Provide sorting: AQI asc/desc, name, city.
+
+
+5.7) HomePage (dashboard)
+File: weighted-routing-app/src/pages/HomePage.js
+
+Responsibilities:
+- Poll system health via backendService.checkBackendHealth() every 60s.
+- If routing healthy: fetch routing stats via getServiceStats().
+- If scraper healthy: fetch and display top stations.
+- Provide “Quick Actions” navigation.
+- Show a mini-map preview using simulated AQI zones (aqiData).
+
+
+5.8) SimulatorPage (hidden dev tool)
+File: weighted-routing-app/src/pages/SimulatorPage.js
+Route: /dev/simulator (not linked in navbar)
+
+Responsibilities:
+- Show backend health pills (routing/ingestion/scraper).
+- Submit single telemetry (vehicle_id, lat/lng, AQI) to ingestion service.
+- Build a path by clicking map, then send telemetry periodically along that path.
+- Trigger scraper refresh via backendService.triggerAQIFetch().
+
+
+5.9) LocationSearch (geocoding)
+File: weighted-routing-app/src/components/LocationSearch.js
+
+Responsibilities:
+- Provide location input with:
+  - local curated India locations (Mumbai/Delhi/Bangalore/etc.)
+  - Nominatim (OpenStreetMap) search restricted to India
+- Supports “pin” mode for setting start/end by clicking on the map.
+- Provides reverseGeocode(lat,lng) for naming map-chosen points.
+
+
+5.10) Legacy / deprecated frontend routing utilities
+These exist but are annotated as deprecated:
+- src/utils/dijkstra.js   (old Dijkstra graph routing over src/data/graphData)
+- src/components/NodeSelector.js (old static node preset selector)
+- src/components/WeightSliders.js + src/components/RouteAlternatives.js
+  - still usable for “legacy weight sliders” UI patterns but the current app emphasizes backend routing.
+
+The current runtime route planner path is backend-first.
+
+
+6) End-to-End Data Flows (Step-by-step)
+---------------------------------------
+
+6.1) Boot / Bring-up sequence (local)
+1) Start backend stack
+   - from Backend/: docker compose up --build
+2) Confirm service health
+   - routing:   GET http://localhost:8000/health
+   - ingestion: GET http://localhost:8080/api/v1/health
+   - scraper:   GET http://localhost:8082/health
+3) Start frontend
+   - from weighted-routing-app/: npm install; npm start
+
+
+6.2) Telemetry ingestion → Redis hot AQI
+1) A vehicle (or simulator) sends telemetry:
+   - POST http://localhost:8080/api/v1/telemetry
+2) ingestion-service:
+   - validates payload
+   - computes H3 hex id
+   - writes into Redis (with TTL)
+   - optionally persists to Timescale/Postgres
+3) routing-service later reads these per-hex aggregates.
+
+
+6.3) Station scraping → Redis station store
+1) aqiscraper runs periodic fetch or manual trigger:
+   - POST http://localhost:8082/fetch
+2) aqiscraper:
+   - scrapes station list + AQI values
+   - maps stations to H3
+   - writes station data into Redis + memory cache
+3) routing-service uses station data as fallback for missing telemetry hexes.
+
+
+6.4) Route calculation (frontend → routing-service)
+1) User selects start/end + balance and presses “Calculate Route”.
+2) Frontend calls either:
+   - POST /api/v1/route (alternatives) OR
+   - POST /api/v1/route/detailed (single route + navigation)
+3) routing-service:
+   - builds/loads OSM graph
+   - enriches edges with AQI by mapping edge geometry to H3
+   - runs A* using cost(time, AQI, balance)
+   - generates alternatives by penalty re-run
+4) Response includes:
+   - coordinates polyline
+   - distance/duration
+   - average/max AQI
+   - weighted_cost
+   - optional navigation steps
+5) Frontend renders:
+   - polylines (selected + alternatives)
+   - step-by-step directions (if present)
+
+
+6.5) AQI map visualization (frontend → routing-service + scraper)
+1) User pans/zooms map.
+2) User presses “Fetch AQI Data” (or enables auto-refresh).
+3) Frontend calls:
+   - POST /api/v1/aqi/area (bounding box)
+   - GET  /stations (optional station overlay)
+4) Frontend renders hex circles + station circles.
+
+
+7) Operational Tooling (scripts)
+--------------------------------
+Folder: Backend/scripts/
+
+- test_system.py
+  - Async aiohttp quick checks:
+    - ingestion health
+    - telemetry single + batch
+    - routing health
+    - AQI area endpoint
+    - route calculation
+
+- test_e2e_backend.py
+  - Rich step-by-step e2e runner (requests + optional colorama/tabulate)
+  - Exercises:
+    - all health checks
+    - telemetry submission
+    - scraper station operations
+    - route requests for balance=0/0.5/1
+    - heatmap area queries
+
+- vehicle_simulator.py
+  - Bulk simulation of N vehicles moving in an area
+  - Sends telemetry either in batch or individually
+
+
+8) Key Contracts and Interface Notes
+------------------------------------
+
+8.1) Coordinate ordering
+- Backend returns route coordinate arrays as [lng, lat].
+- Frontend converts to [lat, lng] for Leaflet.
+
+8.2) Backend availability logic
+- UI uses isBackendAvailable() which probes routing-service /health.
+- Many UI actions are disabled if backend is offline.
+
+8.3) Turn-by-turn navigation
+- Provided only when routing-service is configured with ORS and the endpoint returns navigation.
+- DirectionsPanel filters duplicate “arrive” steps caused by segment stitching.
+
+8.4) No ORS calls from the browser
+- The frontend explicitly documents that it does NOT call ORS directly.
+- ORS integration (if used) is backend-only.
+
+
+9) Troubleshooting / Common Failure Points
+------------------------------------------
+
+9.1) docker compose up --build fails
+- Check which service fails first (routing-service Python deps and OSMnx/geopandas stacks are common culprits).
+- Inspect container logs:
+  - docker compose logs -f routing-service
+  - docker compose logs -f ingestion-service
+  - docker compose logs -f aqiscraper
+- Validate required env vars:
+  - ORS_API_KEY (only if you expect navigation endpoints to return steps)
+  - WAQI_API_KEY (only if WAQI source is enabled/required)
+
+9.2) Routing requests are slow on first run
+- The first graph build (OSMnx) can be expensive.
+- After cache warm-up (graph_service TTL cache), subsequent requests are faster.
+
+9.3) AQI heatmap returns empty
+- Ensure ingestion service has ingested telemetry recently (hex TTL can expire).
+- Or ensure aqiscraper has run a fetch (stations may be empty).
+
+
+10) File-by-File Index (practical entrypoints)
+----------------------------------------------
+Backend (start reading here):
+- Backend/README.md
+- Backend/docker-compose.yml
+- Backend/ingestion-service/cmd/server/main.go
+- Backend/ingestion-service/internal/handler/telemetry.go
+- Backend/ingestion-service/internal/service/telemetry.go
+- Backend/ingestion-service/internal/repository/redis.go
+- Backend/routing-service/app/main.py
+- Backend/routing-service/app/api/routes.py
+- Backend/routing-service/app/services/routing_service.py
+- Backend/routing-service/app/services/graph_service.py
+- Backend/routing-service/app/services/redis_service.py
+- Backend/aqiscraper/entrypoint.go
+- Backend/aqiscraper/service.go
+
+Frontend (start reading here):
+- weighted-routing-app/src/index.js
+- weighted-routing-app/src/App.js
+- weighted-routing-app/src/pages/HomePage.js
+- weighted-routing-app/src/pages/RoutePlanner.js
+- weighted-routing-app/src/components/MapComponent.js
+- weighted-routing-app/src/services/backendService.js
+
+
+END OF DOCUMENT

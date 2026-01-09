@@ -4,10 +4,11 @@ Green Corridor Routing Service
 A FastAPI service for AQI-aware route optimization using OSMnx and NetworkX.
 """
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import logging
+import os
 
 from app.api.routes import router as api_router
 from app.core.config import settings
@@ -15,11 +16,16 @@ from app.services.redis_service import redis_service
 from app.services.graph_service import graph_service
 
 # Configure logging
+log_level = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, log_level),
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Suppress noisy httpx/httpcore logs (chatty "HTTP Request: GET ... 200 OK" lines)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 @asynccontextmanager
@@ -64,8 +70,12 @@ app.include_router(api_router, prefix="/api/v1")
 
 
 @app.get("/health")
-async def health_check():
-    """Health check endpoint."""
+async def health_check(request: Request):
+    """
+    Health check endpoint.
+    
+    Note: This endpoint is excluded from access logging to reduce noise.
+    """
     redis_healthy = await redis_service.ping()
     
     return {
