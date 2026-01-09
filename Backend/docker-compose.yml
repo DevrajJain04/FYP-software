@@ -1,0 +1,106 @@
+version: '3.8'
+
+services:
+  # Redis - Shared State Store
+  redis:
+    image: redis:7-alpine
+    container_name: green-corridor-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - green-corridor-network
+
+  # AQI Scraper Service (provides fallback AQI data from stations)
+  aqiscraper:
+    build:
+      context: ./aqiscraper
+      dockerfile: Dockerfile
+    container_name: green-corridor-aqiscraper
+    ports:
+      - "8082:8082"
+    environment:
+      - PORT=8082
+      - REDIS_URL=redis:6379
+      - H3_RESOLUTION=9
+      - SCRAPE_INTERVAL_MINUTES=30
+      - STATION_TTL_MINUTES=60
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - green-corridor-network
+    restart: unless-stopped
+
+  # Go Ingestion Service
+  ingestion-service:
+    build:
+      context: ./ingestion-service
+      dockerfile: Dockerfile
+    container_name: green-corridor-ingestion
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - REDIS_URL=redis:6379
+      - H3_RESOLUTION=9
+      - AQI_TTL_SECONDS=300
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - green-corridor-network
+    restart: unless-stopped
+
+  # Python Routing Service
+  routing-service:
+    build:
+      context: ./routing-service
+      dockerfile: Dockerfile
+    container_name: green-corridor-routing
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+      - REDIS_URL=redis://redis:6379
+      - H3_RESOLUTION=9
+      - GRAPH_CACHE_TTL=3600
+      - USE_STATION_FALLBACK=true
+      - SCRAPER_SERVICE_URL=http://aqiscraper:8082
+    depends_on:
+      redis:
+        condition: service_healthy
+      aqiscraper:
+        condition: service_started
+    networks:
+      - green-corridor-network
+    restart: unless-stopped
+
+  # Redis Commander (Optional - for debugging)
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: green-corridor-redis-ui
+    ports:
+      - "8081:8081"
+    environment:
+      - REDIS_HOSTS=local:redis:6379
+    depends_on:
+      - redis
+    networks:
+      - green-corridor-network
+    profiles:
+      - debug
+
+networks:
+  green-corridor-network:
+    driver: bridge
+
+volumes:
+  redis_data:
