@@ -17,9 +17,9 @@ from datetime import datetime, timezone
 INGESTION_URL = "http://localhost:8080"
 ROUTING_URL = "http://localhost:8000"
 
-# Test data - Singapore coordinates
-TEST_ORIGIN = {"lat": 1.3521, "lng": 103.8198}  # Singapore center
-TEST_DEST = {"lat": 1.2966, "lng": 103.7764}    # Southwest Singapore
+# Test data - Mumbai coordinates
+TEST_ORIGIN = {"lat": 19.0760, "lng": 72.8777}  # Mumbai center
+TEST_DEST = {"lat": 18.9220, "lng": 72.8347}    # South Mumbai
 
 
 async def test_ingestion_health(session: aiohttp.ClientSession) -> bool:

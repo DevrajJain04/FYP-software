@@ -1,0 +1,246 @@
+GREEN CORRIDOR - EXTENDED BACKEND SYSTEM ARCHITECTURE & SCHEMA
+================================================================
+
+1. SYSTEM ARCHITECTURE & INTERNALS
+================================================================
+The system is designed as a distributed, high-throughput IoT backend for real-time vehicular telemetry ingestion and pollution-aware route optimization.
+
+1.1. Service Mesh (Docker Compose Network)
+------------------------------------------
+- **Network Name**: `green-corridor-network` (Inter-service internal DNS)
+- **Ingestion Service**: Exposes port 8080.
+- **Routing Service**: Exposes port 8000.
+- **AQI Scraper**: Exposes port 8082.
+- **Redis**: Exposes port 6379 (Shared state).
+- **TimescaleDB**: Exposes port 5432 (Persistent storage).
+
+1.2. Persistence Layer Strategies
+---------------------------------
+- **Redis (Cache & Hot State)**:
+  - **Version**: Redis 7-alpine.
+  - **Strategy**: 
+    - Real-time AQI data (`aqi:h3:*`) is ephemeral with TTL (default 300s).
+    - Station data (`station:h3:*`) has longer TTL (1-2 hours).
+    - Pipelining is used heavily in `StoreAQI()` for throughput.
+    - `HSET` used for hexagon buckets to maintain vehicle uniqueness ("One Vehicle, One Vote").
+
+- **TimescaleDB (Historical Data)**:
+  - **Version**: Postgres 15 with TimescaleDB extension.
+  - **Extensions**: `timescaledb`, `postgis` (implicit dependency for future geo-queries).
+  - **Hypertable**: `vehicle_telemetry` partitioned by time (`recorded_at`).
+  - **Ingestion Pattern**: "Fire and Forget" async goroutine in Go service to prevent blocking the HTTP response.
+  - **Connection Pool**: MaxOpenConns=25, MaxIdleConns=10, Lifetime=5m.
+
+2. DETAILED CODING SPECIFICATIONS
+================================================================
+
+2.1. Ingestion Service (Go)
+---------------------------
+**Core Logic (`internal/service/telemetry.go`)**:
+1.  **H3 Calculation**: `h3.LatLngToCell(latLng, resolution=9)`
+    -   Resolution 9 edge length is ~174m, area ~0.1km². Perfect for street-level pollution granularity.
+2.  **Redis Storage**:
+    -   `Pipeline.HSet(ctx, "aqi:h3:{hex_id}", vehicle_id, aqi_value)`
+    -   `Pipeline.Expire(ctx, "aqi:h3:{hex_id}", ttl)`
+    -   `Pipeline.Set(ctx, "vehicle:{vehicle_id}", hex_id, ttl)`
+    -   `Pipeline.Incr(ctx, "stats:ingestions")`
+    -   *Rationale*: Using HSET ensures that if a vehicle sends 10 updates in 1 minute while stuck in traffic, it only updates its entry in the hash. It does not artificially inflate the sample count for that hexagon.
+3.  **Async Persistence**:
+    -   A dedicated goroutine is spawned for each request (or batched) to write to Postgres.
+    -   Risk: If the service crashes, pending in-memory writes to PG might be lost (acceptable for telemetry stream).
+
+**Models (`internal/models/telemetry.go`)**:
+-   `TelemetryData`: Validates inputs (`min=-90, max=90`).
+-   `StatsResponse`: Aggregates real-time stats from Redis + historical stats from PG.
+
+2.2. Routing Service (Python)
+-----------------------------
+**Graph Management (`app/services/graph_service.py`)**:
+1.  **Library**: `OSMnx` + `NetworkX`.
+2.  **Caching**:
+    -   `TTLCache` (maxsize=10, ttl=3600s).
+    -   Key: MD5 hash of bounding box coords `md5("{N}_{S}_{E}_{W}")`.
+    -   Prevents hitting Overpass API (OSM) repeatedly for the same route query.
+3.  **Graph Construction**:
+    -   Fetches `drive` network type.
+    -   Enriches with `speed` and `travel_time`.
+    -   `enrich_graph_with_aqi`: Iterates ALL edges.
+    -   For each edge, finds intersecting H3 hexagons (interpolated every 50m).
+    -   Queries Redis for AQI of those hexagons.
+    -   `Edge AQI` = Average of all intersecting hexagons' AQI.
+
+**Routing Algorithm (`app/services/routing_service.py`)**:
+1.  **Algorithm**: A* (A-Star) Search.
+2.  **Heuristic**: Haversine distance / Max Speed (50m/s). Admissible heuristic ensures optimality.
+3.  **Cost Function**:
+    ```python
+    # balance: 0.0 (Fastest) to 1.0 (Cleanest)
+    # travel_time: seconds
+    # aqi_normalization: 0.6 (constant to scale AQI to comparable magnitude as time)
+
+    time_cost = travel_time * (1 - balance)
+    aqi_cost = aqi * aqi_normalization * balance
+    
+    total_cost = time_cost + aqi_cost
+    ```
+4.  **Alternatives**:
+    -   Uses "Penalty Method".
+    -   Calculates optimal path.
+    -   Penalizes edges in that path (Cost * 1.5).
+    -   Re-runs A* to find next best path.
+    -   Repeats `metadata.alternatives` times.
+
+2.3. AQI Scraper (Go)
+---------------------
+**Scraping Strategy (`aqiscraper/service.go`)**:
+1.  **Sources**:
+    -   `AQI.in`: HTML scraping for Indian cities list -> API calls.
+    -   `WAQI` (World Air Quality Index): API bounding box search for international regions.
+2.  **Execution**:
+    -   Parallel execution using `sync.WaitGroup`.
+    -   Regions defined: SE Asia, Europe, Americas, etc.
+3.  **Storage**:
+    -   Stores Stations in 3 ways:
+        1.  `station:aqi:{h3_index}` -> JSON (Single Station)
+        2.  `station:h3:{h3_index}` -> JSON (Same, for lookup)
+        3.  `stations:all` -> Mega JSON dump for bulk retrieval.
+    -   Logic: "GetStationByH3" checks memory cache first (RWMutex), then Redis.
+
+3. DATABASE SCHEMA DETAILS
+================================================================
+
+3.1. PostgreSQL (TimescaleDB) Schema
+------------------------------------
+```sql
+CREATE TABLE IF NOT EXISTS vehicle_telemetry (
+    id BIGSERIAL,              -- Unique Sequence ID
+    vehicle_id VARCHAR(100) NOT NULL,
+    latitude DOUBLE PRECISION NOT NULL,
+    longitude DOUBLE PRECISION NOT NULL,
+    aqi DOUBLE PRECISION NOT NULL,
+    hexagon_id VARCHAR(20) NOT NULL, -- H3 Index String
+    recorded_at TIMESTAMPTZ NOT NULL, -- Core time dimension
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (id, recorded_at)     -- Composite PK required for Hypertables
+);
+
+-- Converted to Hypertable
+SELECT create_hypertable('vehicle_telemetry', 'recorded_at', ...);
+
+-- Indexes for Query Performance
+CREATE INDEX idx_telemetry_vehicle_id ON vehicle_telemetry(vehicle_id);
+CREATE INDEX idx_telemetry_hexagon_id ON vehicle_telemetry(hexagon_id);
+-- Spatial + Time queries (e.g., "Give me pollution in this area last week")
+CREATE INDEX idx_telemetry_time_hex ON vehicle_telemetry(recorded_at DESC, hexagon_id);
+```
+
+3.2. Redis Data Structures (Exhaustive)
+---------------------------------------
+| Key Pattern | Type | Value Example | Usage |
+|:---|:---|:---|:---|
+| `aqi:h3:{hex_id}` | Hash | `{"vehicle_A": "45.2", "vehicle_B": "50.1"}` | Real-time pollution bucket. Multiple vehicles contribute. |
+| `vehicle:{vehicle_id}` | String | `"8928308280fffff"` (Hex ID) | Tracks last known location of vehicle. |
+| `stats:ingestions` | String | `"10423"` (Integer) | Global counter for total processed packets. |
+| `station:h3:{hex_id}` | String | `{"Location": "Mumbai", "AQI": 120...}` | Fallback data if no vehicles are in the hex. |
+| `stations:last_fetch` | String | `"2025-01-09T10:00:00Z"` | Health check timestamp for scraper. |
+
+4. DATA FLOW DIAGRAM (Low Level)
+================================================================
+
+Start: [Vehicle Sensor]
+    |
+    v (JSON POST)
+[Ingestion Service: /api/v1/telemetry]
+    |
+    +-> 1. Validate JSON (Go Validator)
+    |
+    +-> 2. Calc H3 Index (uber/h3-go)
+    |
+    +-> 3. Redis Pipeline
+    |       |-> HSET aqi:h3:{hex} {vid} {aqi}
+    |       |-> EXPIRE aqi:h3:{hex} 300
+    |       +-> SET vehicle:{vid} {hex}
+    |
+    +-> 4. Goroutine (Async) -> [Postgres Connection Pool] -> INSERT INTO vehicle_telemetry
+    |
+    v (HTTP 202)
+[Vehicle Sensor]
+
+Start: [User Request Route]
+    |
+    v (JSON POST)
+[Routing Service: /api/route]
+    |
+    +-> 1. Check Graph Cache (Memory)
+    |       |-> Miss: [OSMnx] -> Overpass API -> Build Graph -> Store Cache
+    |       +-> Hit: Return NetworkX Graph
+    |
+    +-> 2. Identify Relevant Hexagons
+    |       |-> Iterate all edges -> H3.geo_to_h3(lat, lng)
+    |
+    +-> 3. Fetch Pollution Data
+    |       |-> Redis MGET `aqi:h3:{hex}` (Real data)
+    |       +-> Redis GET `station:h3:{hex}` (Fallback)
+    |
+    +-> 4. Weight Graph Edges
+    |       |-> For edge E: weight = CostFunction(Length, MaxSpeed, AQI)
+    |
+    +-> 5. A* Search (NetworkX)
+            |-> PriorityQueue based on f_score
+            +-> Return Path nodes
+    |
+    v (JSON Response)
+[Mobile App]
+
+5. API CONTRACTS
+================================================================
+
+5.1. Ingestion API
+------------------
+**POST /api/v1/telemetry**
+Request:
+```json
+{
+  "vehicle_id": "v-123",
+  "latitude": 19.0760,
+  "longitude": 72.8777,
+  "aqi": 154.5,
+  "timestamp": "2024-01-01T12:00:00Z"
+}
+```
+Response:
+```json
+{
+  "success": true,
+  "message": "Telemetry processed",
+  "hexagon_id": "8928308280fffff"
+}
+```
+
+5.2. Routing API
+----------------
+**POST /route**
+Request:
+```json
+{
+  "origin": {"lat": 19.07, "lng": 72.87},
+  "destination": {"lat": 19.20, "lng": 72.85},
+  "balance": 0.5,
+  "alternatives": 2
+}
+```
+Response:
+```json
+{
+  "routes": [
+    {
+      "route_id": "uuid-1",
+      "coordinates": [[72.87, 19.07], ...],
+      "total_distance_m": 15400,
+      "total_duration_s": 1200,
+      "average_aqi": 85.5,
+      "weighted_cost": 450.2
+    }
+  ]
+}
+```

@@ -35,6 +35,10 @@ class Settings(BaseSettings):
     SCRAPER_SERVICE_URL: Optional[str] = "http://aqiscraper:8082"  # AQI scraper service URL
     STATION_KEY_PREFIX: str = "station:h3:"  # Redis key prefix for station data
     
+    # OpenRouteService settings (for detailed turn-by-turn navigation)
+    ORS_API_KEY: Optional[str] = "eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6ImY0MjA2NGM2NmFkZjRhYjc5NDA2ZDg2ODU2ZTM4NjI2IiwiaCI6Im11cm11cjY0In0="  # Get from https://openrouteservice.org/dev/#/signup
+    ORS_BASE_URL: str = "https://api.openrouteservice.org"
+    
     class Config:
         env_file = ".env"
         case_sensitive = True

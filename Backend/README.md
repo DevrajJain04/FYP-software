@@ -2,6 +2,8 @@
 
 A high-performance routing engine that balances **Travel Time** and **Air Quality (AQI)** to find optimal "green corridors" through urban areas.
 
+Code navigation index: [CODEMAP.md](CODEMAP.md)
+
 ## Architecture Overview
 
 ```
@@ -91,7 +93,7 @@ go run cmd/server/main.go
 ```bash
 cd aqiscraper
 go mod download
-go run main.go
+go run .
 ```
 
 **4. Start Routing Service:**
@@ -129,7 +131,7 @@ uvicorn app.main:app --reload --port 8000
 | GET | `/stations` | List all scraped stations |
 | GET | `/h3?h3={index}` | Get station for H3 hexagon |
 | GET | `/nearest?lat={lat}&lng={lng}` | Find nearest station |
-| POST | `/scrape` | Trigger manual scrape |
+| POST | `/fetch` | Trigger manual fetch (async) |
 
 ## Example Usage
 
@@ -183,8 +185,9 @@ curl -X POST http://localhost:8000/api/v1/route \
 | PORT | 8082 | Server port |
 | REDIS_URL | localhost:6379 | Redis connection URL |
 | H3_RESOLUTION | 9 | H3 hexagon resolution |
-| SCRAPE_INTERVAL_MINUTES | 30 | Auto-scrape interval |
-| STATION_TTL_MINUTES | 60 | TTL for station data |
+| FETCH_INTERVAL_MINUTES | 120 | Auto-fetch interval |
+| STATION_TTL_MINUTES | 180 | TTL for station data |
+| WAQI_API_KEY | demo | WAQI API token for international stations |
 
 ## License
 MIT License - Final Year Project 2026

@@ -8,6 +8,13 @@ from app.services.routing_service import (
     find_alternative_routes,
     calculate_route_metrics,
 )
+from app.services.ors_service import (
+    ors_client,
+    get_actionable_navigation,
+    OpenRouteServiceClient,
+    NavigationStep,
+    DetailedRoute,
+)
 
 __all__ = [
     "redis_service",
@@ -16,4 +23,9 @@ __all__ = [
     "astar_path",
     "find_alternative_routes",
     "calculate_route_metrics",
+    "ors_client",
+    "get_actionable_navigation",
+    "OpenRouteServiceClient",
+    "NavigationStep",
+    "DetailedRoute",
 ]

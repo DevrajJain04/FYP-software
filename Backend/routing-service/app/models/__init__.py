@@ -10,6 +10,10 @@ from app.models.schemas import (
     AreaAQIRequest,
     AreaAQIResponse,
     ErrorResponse,
+    NavigationStepResponse,
+    NavigationRequest,
+    NavigationResponse,
+    DetailedRouteResponse,
 )
 
 __all__ = [
@@ -22,4 +26,8 @@ __all__ = [
     "AreaAQIRequest",
     "AreaAQIResponse",
     "ErrorResponse",
+    "NavigationStepResponse",
+    "NavigationRequest",
+    "NavigationResponse",
+    "DetailedRouteResponse",
 ]

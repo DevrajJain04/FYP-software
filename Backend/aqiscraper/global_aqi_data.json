@@ -1,9 +1,6 @@
 {
   "description": "Global AQI data - India from aqi.in, International from WAQI API",
-  "sources": [
-    "aqi.in",
-    "waqi"
-  ],
+  "sources": ["aqi.in", "waqi"],
   "fetch_interval": "2 hours",
   "scraped_at": null,
   "stations": []

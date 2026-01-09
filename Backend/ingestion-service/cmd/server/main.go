@@ -34,8 +34,23 @@ func main() {
 	}
 	defer redisRepo.Close()
 
+	// Initialize PostgreSQL repository for persistent storage (optional)
+	var postgresRepo *repository.PostgresRepository
+	if cfg.EnablePersist {
+		postgresRepo, err = repository.NewPostgresRepository(cfg.PostgresURL)
+		if err != nil {
+			log.Printf("⚠️  PostgreSQL not available, telemetry will NOT be persisted: %v", err)
+			postgresRepo = nil
+		} else {
+			defer postgresRepo.Close()
+			log.Println("✅ PostgreSQL connected - telemetry will be persisted for analysis")
+		}
+	} else {
+		log.Println("ℹ️  Persistent storage disabled (ENABLE_PERSIST=false)")
+	}
+
 	// Initialize services
-	telemetrySvc := service.NewTelemetryService(redisRepo, cfg.H3Resolution, cfg.AQITTLSeconds)
+	telemetrySvc := service.NewTelemetryService(redisRepo, postgresRepo, cfg.H3Resolution, cfg.AQITTLSeconds)
 
 	// Initialize handlers
 	telemetryHandler := handler.NewTelemetryHandler(telemetrySvc)

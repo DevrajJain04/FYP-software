@@ -34,10 +34,11 @@ type BatchTelemetryResponse struct {
 
 // StatsResponse represents ingestion statistics
 type StatsResponse struct {
-	TotalHexagons    int64          `json:"total_hexagons"`
-	TotalVehicles    int64          `json:"total_vehicles"`
-	IngestionsPerSec float64        `json:"ingestions_per_sec"`
-	TopHexagons      []HexagonStats `json:"top_hexagons"`
+	TotalHexagons    int64                  `json:"total_hexagons"`
+	TotalVehicles    int64                  `json:"total_vehicles"`
+	IngestionsPerSec float64                `json:"ingestions_per_sec"`
+	TopHexagons      []HexagonStats         `json:"top_hexagons"`
+	PersistentStats  map[string]interface{} `json:"persistent_stats,omitempty"` // PostgreSQL storage stats
 }
 
 // HexagonStats represents statistics for a single hexagon

@@ -32,9 +32,31 @@ services:
       - H3_RESOLUTION=9
       - SCRAPE_INTERVAL_MINUTES=30
       - STATION_TTL_MINUTES=60
+      - WAQI_API_KEY=${WAQI_API_KEY:-demo}
     depends_on:
       redis:
         condition: service_healthy
+    networks:
+      - green-corridor-network
+    restart: unless-stopped
+
+  # TimescaleDB - Persistent Storage for Historical Analysis
+  timescaledb:
+    image: timescale/timescaledb:latest-pg15
+    container_name: green-corridor-timescaledb
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=green_corridor
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     networks:
       - green-corridor-network
     restart: unless-stopped
@@ -50,10 +72,14 @@ services:
     environment:
       - PORT=8080
       - REDIS_URL=redis:6379
+      - POSTGRES_URL=postgres://postgres:postgres@timescaledb:5432/green_corridor?sslmode=disable
       - H3_RESOLUTION=9
       - AQI_TTL_SECONDS=300
+      - ENABLE_PERSIST=true
     depends_on:
       redis:
+        condition: service_healthy
+      timescaledb:
         condition: service_healthy
     networks:
       - green-corridor-network
@@ -98,9 +124,26 @@ services:
     profiles:
       - debug
 
+  # pgAdmin (Optional - for database analysis)
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: green-corridor-pgadmin
+    ports:
+      - "5050:80"
+    environment:
+      - PGADMIN_DEFAULT_EMAIL=admin@greencorridor.local
+      - PGADMIN_DEFAULT_PASSWORD=admin
+    depends_on:
+      - timescaledb
+    networks:
+      - green-corridor-network
+    profiles:
+      - debug
+
 networks:
   green-corridor-network:
     driver: bridge
 
 volumes:
   redis_data:
+  timescale_data:

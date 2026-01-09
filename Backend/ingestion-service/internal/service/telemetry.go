@@ -2,6 +2,7 @@ package service
 
 import (
 	"fmt"
+	"log"
 	"sort"
 	"strings"
 	"time"
@@ -14,15 +15,17 @@ import (
 
 // TelemetryService handles telemetry business logic
 type TelemetryService struct {
-	repo          *repository.RedisRepository
+	redisRepo     *repository.RedisRepository
+	postgresRepo  *repository.PostgresRepository // For persistent storage
 	h3Resolution  int
 	aqiTTLSeconds int
 }
 
 // NewTelemetryService creates a new telemetry service
-func NewTelemetryService(repo *repository.RedisRepository, h3Resolution, aqiTTLSeconds int) *TelemetryService {
+func NewTelemetryService(redisRepo *repository.RedisRepository, postgresRepo *repository.PostgresRepository, h3Resolution, aqiTTLSeconds int) *TelemetryService {
 	return &TelemetryService{
-		repo:          repo,
+		redisRepo:     redisRepo,
+		postgresRepo:  postgresRepo,
 		h3Resolution:  h3Resolution,
 		aqiTTLSeconds: aqiTTLSeconds,
 	}
@@ -40,10 +43,27 @@ func (s *TelemetryService) IngestTelemetry(data *models.TelemetryData) (string, 
 	hexIndex := h3.LatLngToCell(latLng, s.h3Resolution)
 	hexagonID := hexIndex.String()
 
-	// Store in Redis using debounce strategy
-	err := s.repo.StoreAQI(hexagonID, data.VehicleID, data.AQI, s.aqiTTLSeconds)
+	// Store in Redis using debounce strategy (for real-time routing)
+	err := s.redisRepo.StoreAQI(hexagonID, data.VehicleID, data.AQI, s.aqiTTLSeconds)
 	if err != nil {
-		return "", fmt.Errorf("failed to store AQI data: %w", err)
+		return "", fmt.Errorf("failed to store AQI data in Redis: %w", err)
+	}
+
+	// Persist to PostgreSQL for historical analysis (fire and forget, non-blocking)
+	if s.postgresRepo != nil {
+		go func() {
+			record := &repository.TelemetryRecord{
+				VehicleID: data.VehicleID,
+				Latitude:  data.Latitude,
+				Longitude: data.Longitude,
+				AQI:       data.AQI,
+				HexagonID: hexagonID,
+				Timestamp: data.Timestamp,
+			}
+			if err := s.postgresRepo.StoreTelemetry(record); err != nil {
+				log.Printf("Warning: Failed to persist telemetry to PostgreSQL: %v", err)
+			}
+		}()
 	}
 
 	return hexagonID, nil
@@ -54,14 +74,53 @@ func (s *TelemetryService) IngestBatchTelemetry(batch *models.BatchTelemetryData
 	processed := 0
 	failed := 0
 
+	// Collect records for batch persistence
+	var persistRecords []*repository.TelemetryRecord
+
 	for _, data := range batch.Data {
 		dataCopy := data // Create a copy to avoid pointer issues
-		_, err := s.IngestTelemetry(&dataCopy)
+
+		// Set timestamp if not provided
+		if dataCopy.Timestamp.IsZero() {
+			dataCopy.Timestamp = time.Now().UTC()
+		}
+
+		// Convert lat/long to H3 hexagon index
+		latLng := h3.NewLatLng(dataCopy.Latitude, dataCopy.Longitude)
+		hexIndex := h3.LatLngToCell(latLng, s.h3Resolution)
+		hexagonID := hexIndex.String()
+
+		// Store in Redis
+		err := s.redisRepo.StoreAQI(hexagonID, dataCopy.VehicleID, dataCopy.AQI, s.aqiTTLSeconds)
 		if err != nil {
 			failed++
-		} else {
-			processed++
+			continue
 		}
+		processed++
+
+		// Collect for batch persistence
+		if s.postgresRepo != nil {
+			persistRecords = append(persistRecords, &repository.TelemetryRecord{
+				VehicleID: dataCopy.VehicleID,
+				Latitude:  dataCopy.Latitude,
+				Longitude: dataCopy.Longitude,
+				AQI:       dataCopy.AQI,
+				HexagonID: hexagonID,
+				Timestamp: dataCopy.Timestamp,
+			})
+		}
+	}
+
+	// Batch persist to PostgreSQL (fire and forget)
+	if s.postgresRepo != nil && len(persistRecords) > 0 {
+		go func(records []*repository.TelemetryRecord) {
+			inserted, err := s.postgresRepo.StoreTelemetryBatch(records)
+			if err != nil {
+				log.Printf("Warning: Batch persistence failed: %v", err)
+			} else {
+				log.Printf("📦 Persisted %d telemetry records to PostgreSQL", inserted)
+			}
+		}(persistRecords)
 	}
 
 	return processed, failed, nil
@@ -69,7 +128,7 @@ func (s *TelemetryService) IngestBatchTelemetry(batch *models.BatchTelemetryData
 
 // GetStats retrieves current statistics
 func (s *TelemetryService) GetStats() (*models.StatsResponse, error) {
-	hexCount, vehicleCount, err := s.repo.GetStats()
+	hexCount, vehicleCount, err := s.redisRepo.GetStats()
 	if err != nil {
 		return nil, err
 	}
@@ -80,16 +139,23 @@ func (s *TelemetryService) GetStats() (*models.StatsResponse, error) {
 		return nil, err
 	}
 
+	// Get persistent storage stats if available
+	var persistentStats map[string]interface{}
+	if s.postgresRepo != nil {
+		persistentStats, _ = s.postgresRepo.GetTelemetryStats()
+	}
+
 	return &models.StatsResponse{
-		TotalHexagons: hexCount,
-		TotalVehicles: vehicleCount,
-		TopHexagons:   topHexagons,
+		TotalHexagons:   hexCount,
+		TotalVehicles:   vehicleCount,
+		TopHexagons:     topHexagons,
+		PersistentStats: persistentStats,
 	}, nil
 }
 
 // getTopHexagons returns the hexagons with the most vehicles
 func (s *TelemetryService) getTopHexagons(limit int) ([]models.HexagonStats, error) {
-	keys, err := s.repo.GetAllHexagonKeys()
+	keys, err := s.redisRepo.GetAllHexagonKeys()
 	if err != nil {
 		return nil, err
 	}
@@ -101,7 +167,7 @@ func (s *TelemetryService) getTopHexagons(limit int) ([]models.HexagonStats, err
 		hexID := strings.TrimPrefix(key, repository.AQIKeyPrefix)
 
 		// Get AQI data for this hexagon
-		aqiMap, err := s.repo.GetHexagonAQI(hexID)
+		aqiMap, err := s.redisRepo.GetHexagonAQI(hexID)
 		if err != nil {
 			continue
 		}

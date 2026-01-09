@@ -16,7 +16,7 @@ RUN go mod download
 COPY . .
 
 # Build the binary
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o aqiscraper .
+RUN CGO_ENABLED=1 GOOS=linux go build -a -o aqiscraper .
 
 # Runtime stage
 FROM alpine:3.19
