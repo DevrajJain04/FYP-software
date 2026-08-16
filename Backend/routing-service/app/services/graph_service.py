@@ -3,6 +3,8 @@
 import osmnx as ox
 import networkx as nx
 import h3
+import math
+import numbers
 from typing import Dict, List, Tuple, Optional
 from cachetools import TTLCache
 import logging
@@ -33,6 +35,56 @@ class GraphService:
         # Round to 3 decimal places for cache efficiency
         key_str = f"{north:.3f}_{south:.3f}_{east:.3f}_{west:.3f}"
         return hashlib.md5(key_str.encode()).hexdigest()
+
+    def _normalize_maxspeed_values(self, G: nx.MultiDiGraph) -> None:
+        """
+        Normalize edge maxspeed attributes to string/list[str] expected by OSMnx.
+
+        Some OSM extracts provide numeric maxspeed values (e.g., float), which can
+        cause OSMnx's speed parser to raise TypeError during regex splitting.
+        """
+        for _, _, _, data in G.edges(keys=True, data=True):
+            if 'maxspeed' not in data:
+                continue
+
+            maxspeed = data.get('maxspeed')
+            if maxspeed is None:
+                data.pop('maxspeed', None)
+                continue
+
+            if isinstance(maxspeed, numbers.Real) and not isinstance(maxspeed, bool):
+                if math.isnan(float(maxspeed)):
+                    data.pop('maxspeed', None)
+                else:
+                    data['maxspeed'] = str(int(maxspeed) if float(maxspeed).is_integer() else float(maxspeed))
+                continue
+
+            if isinstance(maxspeed, list):
+                normalized = []
+                for value in maxspeed:
+                    if value is None:
+                        continue
+                    if isinstance(value, numbers.Real) and not isinstance(value, bool):
+                        if math.isnan(float(value)):
+                            continue
+                        normalized.append(str(int(value) if float(value).is_integer() else float(value)))
+                    else:
+                        normalized.append(str(value))
+
+                if normalized:
+                    data['maxspeed'] = normalized
+                else:
+                    data.pop('maxspeed', None)
+
+    def _remove_maxspeed_attributes(self, G: nx.MultiDiGraph) -> None:
+        """Remove maxspeed attributes from all edges to force OSMnx defaults."""
+        removed = 0
+        for _, _, _, data in G.edges(keys=True, data=True):
+            if 'maxspeed' in data:
+                data.pop('maxspeed', None)
+                removed += 1
+        if removed:
+            logger.warning(f"Removed maxspeed attribute from {removed} edges due malformed values")
     
     def get_road_graph(
         self,
@@ -64,9 +116,21 @@ class GraphService:
                 simplify=True,
                 truncate_by_edge=True
             )
+
+            # Normalize OSM edge attributes to avoid OSMnx speed parsing crashes
+            self._normalize_maxspeed_values(G)
             
             # Add edge attributes for routing
-            G = ox.add_edge_speeds(G)
+            try:
+                G = ox.add_edge_speeds(G, fallback=40)
+            except TypeError as exc:
+                if "expected string or bytes-like object" not in str(exc):
+                    raise
+                logger.warning(
+                    "OSMnx speed parsing failed on maxspeed values; retrying with maxspeed stripped"
+                )
+                self._remove_maxspeed_attributes(G)
+                G = ox.add_edge_speeds(G, fallback=40)
             G = ox.add_edge_travel_times(G)
             
             # Cache the graph
